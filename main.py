@@ -1,12 +1,40 @@
+from dotenv import load_dotenv
+load_dotenv()
+
+
 import httpx
+import os
+import sqlalchemy
 from fastapi import FastAPI, Response, status
 from fastapi.middleware.cors import CORSMiddleware
-import math # Import the math module
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy import create_engine, Column, String, Integer
 
+# --- Database Setup ---
+DATABASE_URL = os.getenv("database_url")
+# The DATABASE_URL from Render starts with postgres:// but SQLAlchemy needs postgresql://
+if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+# Define our "likes" table model
+class Like(Base):
+    __tablename__ = "likes"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(String, index=True)
+    image_url = Column(String, unique=True)
+
+# Create the table in the database
+Base.metadata.create_all(bind=engine)
+
+# --- FastAPI App Setup ---
 app = FastAPI()
 
 origins = ["*"]
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
@@ -15,9 +43,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ... (image proxy and parsing function are the same)
+# --- API Endpoints ---
+@app.post("/like")
+def like_image(like: dict):
+    db = SessionLocal()
+    # A simple way to add a like. We will improve this later.
+    new_like = Like(user_id=like["user_id"], image_url=like["image_url"])
+    db.add(new_like)
+    db.commit()
+    db.refresh(new_like)
+    db.close()
+    return {"status": "liked", "image_url": new_like.image_url}
+
+# ... (The rest of your endpoints remain the same for now)
 @app.get("/image")
 async def get_image(url: str):
+    # ... (code is unchanged)
     async with httpx.AsyncClient() as client:
         response = await client.get(url)
         if response.status_code == 200:
@@ -27,47 +68,28 @@ async def get_image(url: str):
         else:
             return Response(status_code=status.HTTP_404_NOT_FOUND)
 
-CHAN_IMAGE_BASE_URL = "https://i.4cdn.org/wg/"
-CHAN_WG_CATALOG_URL = "https://a.4cdn.org/wg/catalog.json"
-
-def parse_catalog_for_media(catalog_data: list) -> list:
-    media_list = []
-    for page in catalog_data:
-        for thread in page["threads"]:
-            if "tim" in thread:
-                image_id = thread["tim"]
-                extension = thread["ext"]
-                if extension not in [".webm", ".mp4"]:
-                    image_url = f"{CHAN_IMAGE_BASE_URL}{image_id}{extension}"
-                    thumb_url = f"{CHAN_IMAGE_BASE_URL}{image_id}s.jpg"
-                    media_list.append({
-                        "post_id": thread["no"],
-                        "image_url": image_url,
-                        "thumb_url": thumb_url,
-                        "post_text": thread.get("com", "")
-                    })
-    return media_list
-
-# This is our main data cache
 media_cache = []
 
 @app.get("/")
 async def get_wallpapers(page: int = 1, limit: int = 21):
-    """
-    Fetches media from the cache or 4chan and returns a paginated response.
-    """
+    # ... (code is unchanged)
     global media_cache
-    # If the cache is empty, fill it
     if not media_cache:
         async with httpx.AsyncClient() as client:
-            response = await client.get(CHAN_WG_CATALOG_URL)
+            response = await client.get("https://a.4cdn.org/wg/catalog.json")
             response.raise_for_status()
             raw_data = response.json()
-            media_cache = parse_catalog_for_media(raw_data)
-
-    # Calculate start and end for pagination
+            media_list = []
+            for p in raw_data:
+                for thread in p["threads"]:
+                    if "tim" in thread and thread["ext"] not in [".webm", ".mp4"]:
+                        media_list.append({
+                            "post_id": thread["no"],
+                            "image_url": f"https://i.4cdn.org/wg/{thread['tim']}{thread['ext']}",
+                            "thumb_url": f"https://i.4cdn.org/wg/{thread['tim']}s.jpg",
+                            "post_text": thread.get("com", "")
+                        })
+            media_cache = media_list
     start_index = (page - 1) * limit
     end_index = start_index + limit
-    
-    # Return the requested page of data
     return media_cache[start_index:end_index]
