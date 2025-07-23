@@ -1,22 +1,21 @@
-
-
 import httpx
 import os
 import sqlalchemy
 import random
+import asyncio # Import asyncio for concurrent requests
 from fastapi import FastAPI, Response, status, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy.orm import sessionmaker, Session, declarative_base # CORRECTED: Added declarative_base import
+from sqlalchemy.orm import sessionmaker, Session, declarative_base
 from sqlalchemy import create_engine, Column, String, Integer
 from collections import Counter
 
-# --- Database Setup ---
+# --- Database Setup (Unchanged) ---
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./local.db")
 if DATABASE_URL and DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base() # This line will now work correctly
+Base = declarative_base()
 
 class Like(Base):
     __tablename__ = "likes"
@@ -34,7 +33,7 @@ def get_db():
     finally:
         db.close()
 
-# --- FastAPI App Setup ---
+# --- FastAPI App Setup (Unchanged) ---
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
@@ -44,72 +43,69 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- Data Fetching & Caching ---
-BOARDS_TO_FETCH = ['wg', 'w', 'hr', 'g', 'a'] 
+# --- NEW: Advanced Data Fetching & Caching ---
+BOARDS_TO_FETCH = ['wg', 'w', 'hr', 'g', 'a', 'gif'] # Added /gif/ board
 media_cache = {board: [] for board in BOARDS_TO_FETCH}
+
+async def fetch_thread(client, board, thread_no):
+    """Fetches all posts from a single thread."""
+    thread_posts = []
+    try:
+        thread_res = await client.get(f"https://a.4cdn.org/{board}/thread/{thread_no}.json")
+        thread_res.raise_for_status()
+        thread_data = thread_res.json()
+        for post in thread_data["posts"]:
+            if "tim" in post and post.get("ext"): # Check for image and extension
+                thread_posts.append({
+                    "board": board,
+                    "post_id": post["no"],
+                    "image_url": f"https://i.4cdn.org/{board}/{post['tim']}{post['ext']}",
+                    "thumb_url": f"https://i.4cdn.org/{board}/{post['tim']}s.jpg",
+                })
+    except Exception as e:
+        print(f"Could not fetch thread {thread_no} from /{board}/: {e}")
+    return thread_posts
 
 @app.on_event("startup")
 async def populate_media_cache():
     print("Populating media cache from 4chan for boards:", BOARDS_TO_FETCH)
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=30.0) as client:
         for board in BOARDS_TO_FETCH:
             try:
-                response = await client.get(f"https://a.4cdn.org/{board}/catalog.json")
-                response.raise_for_status()
-                raw_data = response.json()
-                board_posts = []
-                for page in raw_data:
-                    for thread in page["threads"]:
-                        if "tim" in thread and thread.get("ext") not in [".webm", ".mp4"]:
-                            board_posts.append({
-                                "board": board,
-                                "post_id": thread["no"],
-                                "image_url": f"https://i.4cdn.org/{board}/{thread['tim']}{thread['ext']}",
-                                "thumb_url": f"https://i.4cdn.org/{board}/{thread['tim']}s.jpg",
-                            })
-                media_cache[board] = board_posts
-                print(f"-> Fetched {len(board_posts)} items for /{board}/")
+                # 1. Get the list of thread numbers from the catalog
+                catalog_res = await client.get(f"https://a.4cdn.org/{board}/catalog.json")
+                catalog_res.raise_for_status()
+                catalog_data = catalog_res.json()
+                thread_numbers = [thread["no"] for page in catalog_data for thread in page["threads"]]
+                
+                # 2. Create tasks to fetch all threads concurrently
+                tasks = [fetch_thread(client, board, thread_no) for thread_no in thread_numbers]
+                
+                # 3. Run all tasks and wait for them to complete
+                results = await asyncio.gather(*tasks)
+                
+                # 4. Flatten the list of lists into a single list of posts
+                all_board_posts = [post for thread_posts in results for post in thread_posts]
+                random.shuffle(all_board_posts) # Shuffle posts for variety
+                media_cache[board] = all_board_posts
+                print(f"-> Fetched {len(all_board_posts)} items for /{board}/")
             except Exception as e:
-                print(f"Failed to fetch from board /{board}/: {e}")
+                print(f"Failed to process board /{board}/: {e}")
     print("Media cache populated.")
 
-# --- API Endpoints ---
+
+# --- API Endpoints (Unchanged) ---
 @app.get("/boards")
 def get_boards():
-    """Returns the list of available boards."""
     return BOARDS_TO_FETCH
 
 @app.get("/board/{board_name}")
 def get_board_media(board_name: str, page: int = 1, limit: int = 21):
-    """Returns a paginated list of media for a specific board."""
     if board_name not in media_cache:
         return Response(status_code=status.HTTP_404_NOT_FOUND)
-    
     posts = media_cache[board_name]
     start_index = (page - 1) * limit
     end_index = start_index + limit
-    
     return posts[start_index:end_index]
 
-@app.get("/image")
-async def get_image(url: str):
-    """Proxy for fetching images."""
-    async with httpx.AsyncClient() as client:
-        response = await client.get(url)
-        if response.status_code == 200:
-            return Response(content=response.content, media_type=response.headers['content-type'])
-        else:
-            return Response(status_code=status.HTTP_404_NOT_FOUND)
-
-@app.post("/like")
-def like_image(like_data: dict, db: Session = Depends(get_db)):
-    # Check if like already exists to prevent duplicates
-    existing_like = db.query(Like).filter(Like.user_id == like_data["user_id"], Like.image_url == like_data["image_url"]).first()
-    if existing_like:
-        return existing_like
-
-    new_like = Like(user_id=like_data["user_id"], image_url=like_data["image_url"], board=like_data["board"])
-    db.add(new_like)
-    db.commit()
-    db.refresh(new_like)
-    return new_like
+# ... (The rest of your endpoints: /image, /like, etc., can remain the same)
